@@ -1,0 +1,179 @@
+import numpy as np
+import pandas as pd
+#import xgboost as xgb
+#from xgboost import XGBRegressor
+
+store=pd.read_csv('store.csv')
+train=pd.read_csv('train.csv')
+test=pd.read_csv('test.csv')
+
+print(train.head())
+print(test.head())
+print(store.head())
+
+n_store_records=store.shape[0]
+n_train_records=train.shape[0]
+n_test_records=test.shape[0]
+
+print("Total number of store records: {}".format(n_store_records))
+print("Total number of train records: {}".format(n_train_records))
+print("Total number of test records: {}".format(n_test_records))
+
+print(list(set(train['StateHoliday'])) )
+train['StateHoliday'].replace(0,'0',inplace = True)
+print(list(set(train['StateHoliday'])) )
+
+test.fillna(1, inplace=True)
+store.fillna(0, inplace=True)
+train['Open']=train['Open'].astype('float64')
+
+#合并表
+train_store=pd.merge(train,store)
+test_store=pd.merge(test,store)
+train_store.head()
+
+import time
+import datetime as dt
+def features_create(data):
+    #独热编码
+    data=data.join(pd.get_dummies(data[['StoreType', 'Assortment','StateHoliday']])) 
+    
+    #修改日期格式
+    data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
+    data['Year'] = data.Date.dt.year
+    data['Month'] = data.Date.dt.month
+    data['Day'] = data.Date.dt.day
+    data['DayOfWeek'] = data.Date.dt.dayofweek
+    data['WeekOfYear'] = data.Date.dt.weekofyear
+    
+    #对竞争对手和促销时间进行拆分
+    data['CompetitionOpen'] = 12 * (data.Year - data.CompetitionOpenSinceYear) + (data.Month - data.CompetitionOpenSinceMonth)
+    data['PromoOpen'] = 12 * (data.Year - data.Promo2SinceYear) +(data.WeekOfYear - data.Promo2SinceWeek) / 4.0
+    data['CompetitionOpen'] = data.CompetitionOpen.apply(lambda x: x if x > 0 else 0)        
+    data['PromoOpen'] = data.PromoOpen.apply(lambda x: x if x > 0 else 0)
+
+    
+    #处理PromoInterval字段
+    month2str = {1:'Jan', 2:'Feb', 3:'Mar', 4:'Apr', 5:'May', 6:'Jun',7:'Jul', 8:'Aug', 9:'Sept', 10:'Oct', 11:'Nov', 12:'Dec'}
+    data['monthStr'] = data.Month.map(month2str)
+    data.loc[data.PromoInterval == 0, 'PromoInterval'] = ''
+    data['IsPromoMonth'] = 0
+    for interval in data.PromoInterval.unique():
+        if interval != '':
+            for month in interval.split(','):
+                data.loc[(data.monthStr == month) & (data.PromoInterval == interval), 'IsPromoMonth'] = 1
+    return data
+    final_train_store_1=features_create(train_store)
+    final_test_store_1=features_create(test_store)
+    
+    final_test_store_1['StateHoliday_b']=0
+final_test_store_1['StateHoliday_c']=0
+final_test_store_1['StateHoliday_b'].astype('uint8')
+final_test_store_1['StateHoliday_c'].astype('uint8')
+
+final_train_store_1 = final_train_store_1.sort_values(['Date'],ascending = False)
+ho_test = final_train_store_1[:6*7*1115]
+ho_train = final_train_store_1[6*7*1115:]
+
+ho_test = ho_test[ho_test["Open"] != 0]
+ho_test = ho_test[ho_test["Sales"] > 0]
+ho_train = ho_train[ho_train["Open"] != 0]
+ho_train = ho_train[ho_train["Sales"] > 0]
+
+ho_train.drop(['Date','Customers','PromoInterval','monthStr','StateHoliday','StoreType','Assortment'],axis=1,inplace =True)
+ho_test.drop(['Date','Customers','PromoInterval','monthStr','StateHoliday','StoreType','Assortment'],axis=1,inplace =True)
+ho_xtrain = ho_train.drop(['Sales'],axis=1 )
+ho_ytrain = np.log1p(ho_train.Sales)
+ho_xtest = ho_test.drop(['Sales'],axis=1 )
+ho_ytest = np.log1p(ho_test.Sales)
+
+print("Training set has {} samples.".format(ho_xtrain.shape[0]))
+print("Testing set has {} samples.".format(ho_xtest.shape[0]))
+def rmspe(y, yhat):
+    return np.sqrt(np.mean((yhat/y-1) ** 2))
+
+def rmspe_xg(yhat, y):
+    y = np.expm1(y.get_label())
+    yhat = np.expm1(yhat)
+    return "rmspe", rmspe(y,yhat)
+    
+import xgboost as xgb
+dtrain = xgb.DMatrix(ho_xtrain, ho_ytrain)
+dvalid = xgb.DMatrix(ho_xtest, ho_ytest)
+watchlist = [(dtrain, 'train'), (dvalid, 'eval')]
+from time import time
+params = {"objective": "reg:linear","booster" : "gbtree","eta": 0.02,"max_depth":8,"subsample": 0.9,"colsample_bytree": 0.9, "silent": 1,"seed": 10,"learning_rate":0.02}
+#num_boost_round = 3000
+num_trees=6000
+
+print("Train a XGBoost model")
+start = time()
+gbm = xgb.train(params,dtrain,num_trees,evals=watchlist,early_stopping_rounds=100, verbose_eval=True,feval=rmspe_xg)
+end = time()
+print('Training time is {:2f} s.'.format(end-start))
+%matplotlib inline
+from xgboost import plot_importance
+from matplotlib import pyplot as plt
+import operator
+Importances=gbm.get_fscore()
+Feature_Importance=sorted(Importances.items(),key=operator.itemgetter(1))
+df=pd.DataFrame(Feature_Importance,columns=['feature','fscore'])
+df['fscore']=df['fscore']/df['fscore'].sum()
+featp=df.plot(kind='bar',x='feature',y='fscore',color='blue')
+plt.title('Feature_Importance')
+plt.xlabel('Relative_Importance')
+print("validating")
+ho_xtest.sort_index(inplace=True) 
+ho_ytest.sort_index(inplace=True) 
+yhat = gbm.predict(xgb.DMatrix(ho_xtest))
+error = rmspe(np.expm1(ho_ytest), np.expm1(yhat))
+ 
+print('RMSPE: {:.6f}'.format(error))
+res = pd.DataFrame(data = ho_ytest)
+res['Prediction']=yhat
+res = pd.merge(ho_xtest,res, left_index= True, right_index=True)
+res['Ratio'] = res.Prediction/res.Sales
+res['Error'] =abs(res.Ratio-1)
+res['Weight'] = res.Sales/res.Prediction
+res.head()
+col_1 = ['Sales','Prediction']
+col_2 = ['Ratio']
+L=np.random.randint( low=1,high = 1115, size = 3 ) 
+print('Mean Ratio of predition and real sales data is {}: store all'.format(res.Ratio.mean()))
+for i in L:
+    
+    s1 = pd.DataFrame(res[res['Store']==i],columns = col_1)
+    s2 = pd.DataFrame(res[res['Store']==i],columns = col_2)
+    s1.plot(title = 'Comparation of predition and real sales data: store {}'.format(i),figsize=(12,4))
+    s2.plot(title = 'Ratio of predition and real sales data: store {}'.format(i),figsize=(12,4))
+    print('Mean Ratio of predition and real sales data is {}: store {}'.format(s2.Ratio.mean(),i))
+res.sort_values(['Error'],ascending=False,inplace= True)
+res[:10]
+L=range(1115)
+W_ho=[]
+W_test=[]
+for i in L:
+    s1 = pd.DataFrame(res[res['Store']==i+1],columns = col_1)
+    s2 = pd.DataFrame(final_test_store_1[final_test_store_1['Store']==i+1])
+    W1=[(0.990+(i/1000)) for i in range(20)]
+    S =[]
+    for w in W1:
+        error = rmspe(np.expm1(s1.Sales), np.expm1(s1.Prediction*w))
+        S.append(error)
+    Score = pd.Series(S,index=W1)
+    BS = Score[Score.values == Score.values.min()]
+    a=np.array(BS.index.values)
+    b_ho=a.repeat(len(s1))
+    b_test=a.repeat(len(s2))
+    W_ho.extend(b_ho.tolist())
+    W_test.extend(b_test.tolist())
+yhat_new = yhat*W_ho
+error = rmspe(np.expm1(ho_ytest),np.expm1(yhat_new))
+print ('RMSPE for weight corretion {:6f}'.format(error))
+ID= final_test_store_1['Id'].to_frame()
+ID.head()
+final_test_store_1.drop(['Date','Id','PromoInterval','monthStr','StateHoliday','StoreType','Assortment'],axis=1,inplace =True)
+final_test_store_1 = final_test_store_1[ho_xtrain.columns]
+dtest = xgb.DMatrix(final_test_store_1)
+test_probs = gbm.predict(dtest)
+    
